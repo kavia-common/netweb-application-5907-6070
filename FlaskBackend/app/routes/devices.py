@@ -92,7 +92,8 @@ def _mongo_collection():
       - MONGODB_DB_NAME
       - MONGODB_COLLECTION_NAME
     """
-    uri = os.getenv("MONGODB_URI")
+    #uri = os.getenv("MONGODB_URI")
+    uri = "https://kavia-alb-dfbeb1c3-792447743.backend.kavia.app/"
     dbname = os.getenv("MONGODB_DB_NAME")
     collname = os.getenv("MONGODB_COLLECTION_NAME")
 
