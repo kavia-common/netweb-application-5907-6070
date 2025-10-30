@@ -24,14 +24,13 @@ OpenAPI/Swagger UI:
 
 API summary:
 - GET /devices — list devices
-- POST /devices — create device (requires id, name, ip_address, device_type, location)
-- GET /devices/{id} — get device by id
-- PUT /devices/{id} — update device fields (name, ip_address, device_type, location)
-- DELETE /devices/{id} — delete device by id
+- POST /devices — create device (requires name, ip_address, device_type, location)
+- GET /devices/{name} — get device by unique name
+- PUT /devices/{name} — update device fields (name, ip_address, device_type, location) and optionally rename
+- DELETE /devices/{name} — delete device by unique name
 
 Validation rules:
-- id: unique integer
-- name: non-empty string
+- name: non-empty string (unique)
 - ip_address: IPv4 format
 - device_type: one of [router, switch, server]
 - location: non-empty string

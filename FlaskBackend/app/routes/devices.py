@@ -50,28 +50,21 @@ def _validate_ipv4(ip: str) -> bool:
         return False
 
 
-def _validate_device_payload(payload: Dict[str, Any], require_id: bool = True) -> Optional[Dict[str, List[str]]]:
+def _validate_device_payload(payload: Dict[str, Any]) -> Optional[Dict[str, List[str]]]:
     """
-    Validates device payload.
-    When require_id=True, ensures 'id' is present and integer.
+    Validates device payload for create/update.
+    Ensures 'name', 'ip_address', 'device_type', and 'location' are valid.
     Returns None if valid, otherwise a dict of field->list(errors).
     """
     errors: Dict[str, List[str]] = {}
 
-    # id
-    if require_id:
-        if "id" not in payload:
-            errors.setdefault("id", []).append("Missing required field 'id'.")
-        else:
-            if not isinstance(payload["id"], int):
-                errors.setdefault("id", []).append("Field 'id' must be an integer.")
-    else:
-        # In PUT body we do not require 'id' (id comes from path), but if present must be integer and match path (checked externally)
-        if "id" in payload and not isinstance(payload["id"], int):
-            errors.setdefault("id", []).append("Field 'id' must be an integer if provided.")
+    # Disallow id entirely now
+    if "id" in payload:
+        errors.setdefault("id", []).append("Field 'id' is not allowed.")
 
     # name
-    if "name" not in payload or not isinstance(payload.get("name"), str) or not payload.get("name", "").strip():
+    name = payload.get("name")
+    if name is None or not isinstance(name, str) or not name.strip():
         errors.setdefault("name", []).append("Field 'name' is required and must be a non-empty string.")
 
     # ip_address
@@ -117,18 +110,19 @@ def _mongo_collection():
     client = MongoClient(uri)
     db = client[dbname]
     coll = db[collname]
-    # Ensure unique index on 'id'
+    # Ensure unique index on 'name'
     try:
-        coll.create_index([("id", ASCENDING)], unique=True, background=True)
+        coll.create_index([("name", ASCENDING)], unique=True, background=True)
     except Exception as e:
-        logger.warning("Could not ensure index on 'id': %s", e)
+        logger.warning("Could not ensure index on 'name': %s", e)
     return coll
 
 
 def _sanitize(doc: Dict[str, Any]) -> Dict[str, Any]:
-    """Converts MongoDB document to API schema (removes _id)."""
+    """Converts MongoDB document to API schema (removes internal fields like _id and legacy id)."""
     d = dict(doc)
     d.pop("_id", None)
+    d.pop("id", None)
     return d
 
 
@@ -161,9 +155,9 @@ class DevicesCollection(MethodView):
     def post(self):
         """
         Creates a new device.
-        Expects JSON body with fields: id (int), name, ip_address, device_type, location.
+        Expects JSON body with fields: name, ip_address, device_type, location.
         Returns:
-          201: Created device JSON.
+          201: Created device JSON (without internal identifiers).
           400: Bad request with validation errors.
           500: Internal server error.
         """
@@ -174,29 +168,30 @@ class DevicesCollection(MethodView):
             logger.warning("POST /devices invalid JSON body")
             return {"error": "Invalid JSON body."}, 400
 
-        errors = _validate_device_payload(payload, require_id=True)
+        errors = _validate_device_payload(payload)
         if errors:
             logger.info("POST /devices validation failed: %s", errors)
             return {"error": "Invalid input.", "errors": errors}, 400
 
         try:
             coll = _mongo_collection()
-            # Ensure unique id
-            existing = coll.find_one({"id": payload["id"]})
+            # Application-level uniqueness check on 'name'
+            existing = coll.find_one({"name": payload["name"].strip()})
             if existing:
-                logger.info("POST /devices conflict: id=%s already exists", payload["id"])
-                return {"error": "Device with given id already exists."}, 400
+                logger.info("POST /devices conflict: name=%s already exists", payload["name"])
+                return {"error": "Device with given name already exists."}, 400
 
-            result = coll.insert_one({
-                "id": payload["id"],
+            coll.insert_one({
                 "name": payload["name"].strip(),
                 "ip_address": payload["ip_address"],
                 "device_type": payload["device_type"],
                 "location": payload["location"].strip(),
             })
-            logger.info("POST /devices created device with _id=%s id=%s", str(result.inserted_id), payload["id"])
-            created = coll.find_one({"id": payload["id"]}, {"_id": 0})
-            return created, 201
+            created = coll.find_one({"name": payload["name"].strip()})
+            if not created:
+                logger.error("POST /devices: created document not found by name lookup.")
+                return {"error": "Internal server error."}, 500
+            return _sanitize(created), 201
         except PyMongoError as e:
             logger.exception("Database error on POST /devices: %s", e)
             return {"error": "Internal server error."}, 500
@@ -205,111 +200,114 @@ class DevicesCollection(MethodView):
             return {"error": "Internal server error."}, 500
 
 
-@blp.route("/<int:device_id>")
+@blp.route("/<string:name>")
 class DeviceItem(MethodView):
     """
     PUBLIC_INTERFACE
-    GET /devices/{id}: Retrieve device by ID.
+    GET /devices/{name}: Retrieve device by name.
     PUBLIC_INTERFACE
-    PUT /devices/{id}: Update device by ID.
+    PUT /devices/{name}: Update device by name.
     PUBLIC_INTERFACE
-    DELETE /devices/{id}: Delete device by ID.
+    DELETE /devices/{name}: Delete device by name.
     """
 
-    def get(self, device_id: int):
+    def get(self, name: str):
         """
-        Retrieves a device by id.
+        Retrieves a device by name.
         Path params:
-          id: integer unique device id
+          name: unique device name
         Returns:
           200: Device JSON
           404: Not found
           500: Internal server error
         """
-        logger.info("GET /devices/%s requested", device_id)
+        logger.info("GET /devices/%s requested", name)
         try:
             coll = _mongo_collection()
-            doc = coll.find_one({"id": device_id}, {"_id": 0})
+            doc = coll.find_one({"name": name})
             if not doc:
-                logger.info("GET /devices/%s not found", device_id)
+                logger.info("GET /devices/%s not found", name)
                 return {"error": "Device not found."}, 404
-            return doc, 200
+            return _sanitize(doc), 200
         except Exception as e:
-            logger.exception("Error fetching device %s: %s", device_id, e)
+            logger.exception("Error fetching device %s: %s", name, e)
             return {"error": "Internal server error."}, 500
 
-    def put(self, device_id: int):
+    def put(self, name: str):
         """
-        Updates a device by id.
+        Updates a device by name.
         Body must include name, ip_address, device_type, location.
-        If body includes 'id', it must match the path id.
         Returns:
           200: Updated device
           400: Validation error
           404: Not found
           500: Internal server error
         """
-        logger.info("PUT /devices/%s requested", device_id)
+        logger.info("PUT /devices/%s requested", name)
         try:
             payload = request.get_json(force=True, silent=False)
         except Exception:
-            logger.warning("PUT /devices/%s invalid JSON body", device_id)
+            logger.warning("PUT /devices/%s invalid JSON body", name)
             return {"error": "Invalid JSON body."}, 400
 
-        errors = _validate_device_payload(payload, require_id=False)
+        errors = _validate_device_payload(payload)
         if errors:
-            logger.info("PUT /devices/%s validation failed: %s", device_id, errors)
+            logger.info("PUT /devices/%s validation failed: %s", name, errors)
             return {"error": "Invalid input.", "errors": errors}, 400
-
-        if "id" in payload and payload["id"] != device_id:
-            logger.info("PUT /devices/%s id mismatch: payload id=%s", device_id, payload["id"])
-            return {"error": "Path id and payload id must match if 'id' is provided."}, 400
 
         try:
             coll = _mongo_collection()
-            # Ensure device exists
-            existing = coll.find_one({"id": device_id})
+            # Ensure device exists with current name
+            existing = coll.find_one({"name": name})
             if not existing:
-                logger.info("PUT /devices/%s not found", device_id)
+                logger.info("PUT /devices/%s not found", name)
                 return {"error": "Device not found."}, 404
 
+            new_name = payload["name"].strip()
+            # If renaming, ensure new name is unique
+            if new_name != name:
+                conflict = coll.find_one({"name": new_name})
+                if conflict:
+                    logger.info("PUT /devices/%s conflict: new name '%s' already exists", name, new_name)
+                    return {"error": "Device with given name already exists."}, 400
+
             update_doc = {
-                "name": payload["name"].strip(),
+                "name": new_name,
                 "ip_address": payload["ip_address"],
                 "device_type": payload["device_type"],
                 "location": payload["location"].strip(),
             }
-            coll.update_one({"id": device_id}, {"$set": update_doc})
-            updated = coll.find_one({"id": device_id}, {"_id": 0})
-            logger.info("PUT /devices/%s updated", device_id)
-            return updated, 200
+            coll.update_one({"name": name}, {"$set": update_doc})
+            updated = coll.find_one({"name": new_name})
+            logger.info("PUT /devices/%s updated", name)
+            return _sanitize(updated), 200
         except PyMongoError as e:
-            logger.exception("Database error on PUT /devices/%s: %s", device_id, e)
+            logger.exception("Database error on PUT /devices/%s: %s", name, e)
             return {"error": "Internal server error."}, 500
         except Exception as e:
-            logger.exception("Unhandled error on PUT /devices/%s: %s", device_id, e)
+            logger.exception("Unhandled error on PUT /devices/%s: %s", name, e)
             return {"error": "Internal server error."}, 500
 
-    def delete(self, device_id: int):
+    def delete(self, name: str):
         """
-        Deletes a device by id.
+        Deletes a device by name.
         Returns:
           204: No Content on success
           404: Not found
           500: Internal server error
         """
-        logger.info("DELETE /devices/%s requested", device_id)
+        logger.info("DELETE /devices/%s requested", name)
         try:
             coll = _mongo_collection()
-            res = coll.delete_one({"id": device_id})
+            res = coll.delete_one({"name": name})
             if res.deleted_count == 0:
-                logger.info("DELETE /devices/%s not found", device_id)
+                logger.info("DELETE /devices/%s not found", name)
                 return {"error": "Device not found."}, 404
-            logger.info("DELETE /devices/%s deleted", device_id)
+            logger.info("DELETE /devices/%s deleted", name)
             return "", 204
         except PyMongoError as e:
-            logger.exception("Database error on DELETE /devices/%s: %s", device_id, e)
+            logger.exception("Database error on DELETE /devices/%s: %s", name, e)
             return {"error": "Internal server error."}, 500
         except Exception as e:
-            logger.exception("Unhandled error on DELETE /devices/%s: %s", device_id, e)
+            logger.exception("Unhandled error on DELETE /devices/%s: %s", name, e)
             return {"error": "Internal server error."}, 500
