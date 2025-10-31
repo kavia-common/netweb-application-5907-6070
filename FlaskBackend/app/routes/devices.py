@@ -92,8 +92,7 @@ def _mongo_collection():
       - MONGODB_DB_NAME
       - MONGODB_COLLECTION_NAME
     """
-    #uri = os.getenv("MONGODB_URI")
-    uri = "https://kavia-alb-dfbeb1c3-792447743.backend.kavia.app/"
+    uri = os.getenv("MONGODB_URI")
     dbname = os.getenv("MONGODB_DB_NAME")
     collname = os.getenv("MONGODB_COLLECTION_NAME")
 
@@ -151,7 +150,7 @@ class DevicesCollection(MethodView):
             return devices, 200
         except Exception as e:
             logger.exception("Error fetching devices: %s", e)
-            return {"error": "Internal server error."}, 500
+            return {"error": e}, 500
 
     def post(self):
         """
